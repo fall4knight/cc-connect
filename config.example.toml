@@ -572,6 +572,29 @@ level = "info" # debug, info, warn, error
 # bot_token = "xoxb-..."
 # app_token = "xapp-..."
 
+# -----------------------------------------------------------------------------
+# TTADK agent (ByteDance internal fork of Claude Code) / ByteDance 内部的 ttadk
+# -----------------------------------------------------------------------------
+# TTADK shares the stream-json protocol with Claude Code but ships its own CLI
+# binary, auth (~/.ttadk/auth.json) and model slugs (glm-5.1, kimi-k2.6,
+# claude-opus-4-6 via the ByteDance gateway). Use a separate project entry so
+# your personal Claude Code session and the TTADK session never collide.
+#
+# [[projects]]
+# name = "ttadk-work"
+# mode = "single"
+# base_dir = "~/code"
+#
+# [projects.agent]
+# type = "ttadk"
+#
+# [projects.agent.options]
+# # cli_path = "ttadk"                 # default; override with an absolute path if needed
+# model = "glm-5.1"                    # glm-5.1 | kimi-k2.6 | claude-opus-4-6
+# mode = "default"                     # same permission modes as claudecode
+# # allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
+# # env = { TTADK_HACK_STATE_FILE = "~/.ttadk/hack.state.off" }  # per-session hack isolation
+
 # =============================================================================
 # Project 1 / 项目 1
 # =============================================================================
