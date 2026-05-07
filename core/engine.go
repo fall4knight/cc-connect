@@ -4011,6 +4011,45 @@ const listPageSize = 20
 // dirCardPageSize is the max directory history rows per card page (Feishu / other card UIs).
 const dirCardPageSize = 20
 
+// parseListArgs extracts the (allMode, page) pair from /list arguments.
+// "/list" → (false, 1), "/list 3" → (false, 3), "/list all" → (true, 1),
+// "/list all 2" → (true, 2). Unknown leading tokens fall back to (false, 1).
+func parseListArgs(args []string) (allMode bool, page int) {
+	page = 1
+	if len(args) == 0 {
+		return false, 1
+	}
+	idx := 0
+	if strings.EqualFold(args[0], "all") {
+		allMode = true
+		idx = 1
+	}
+	if idx < len(args) {
+		if n, err := strconv.Atoi(args[idx]); err == nil && n > 0 {
+			page = n
+		}
+	}
+	return allMode, page
+}
+
+// fetchSessionsForList runs ListSessions or ListAllSessions depending on
+// allMode. In all mode, applySessionFilter is skipped (cross-cwd scope makes
+// owned-only filtering meaningless). Falls back to single-dir ListSessions if
+// the agent doesn't implement AllSessionsLister.
+func (e *Engine) fetchSessionsForList(agent Agent, sm *SessionManager, allMode bool) ([]AgentSessionInfo, error) {
+	if allMode {
+		if lister, ok := agent.(AllSessionsLister); ok {
+			return lister.ListAllSessions(e.ctx)
+		}
+		// Agent doesn't support cross-cwd listing; fall back transparently.
+	}
+	infos, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		return nil, err
+	}
+	return e.applySessionFilter(infos, sm), nil
+}
+
 func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
@@ -4018,13 +4057,14 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		return
 	}
 
+	allMode, requestedPage := parseListArgs(args)
+
 	if !supportsCards(p) {
-		agentSessions, err := agent.ListSessions(e.ctx)
+		agentSessions, err := e.fetchSessionsForList(agent, sessions, allMode)
 		if err != nil {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
 			return
 		}
-		agentSessions = e.applySessionFilter(agentSessions, sessions)
 		if len(agentSessions) == 0 {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
 			return
@@ -4033,12 +4073,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		total := len(agentSessions)
 		totalPages := (total + listPageSize - 1) / listPageSize
 
-		page := 1
-		if len(args) > 0 {
-			if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
-				page = n
-			}
-		}
+		page := requestedPage
 		if page > totalPages {
 			page = totalPages
 		}
@@ -4078,8 +4113,12 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 					displayName = string([]rune(displayName)[:40]) + "…"
 				}
 			}
-			sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
-				marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+			line := fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s",
+				marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04"))
+			if allMode && s.WorkDir != "" {
+				line += " · 📁 " + abbrevWorkDir(s.WorkDir)
+			}
+			sb.WriteString(line + "\n")
 		}
 		if totalPages > 1 {
 			sb.WriteString(fmt.Sprintf(e.i18n.T(MsgListPageHint), page, totalPages))
@@ -4089,13 +4128,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		return
 	}
 
-	page := 1
-	if len(args) > 0 {
-		if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
-			page = n
-		}
-	}
-	card, err := e.renderListCard(msg.SessionKey, page)
+	card, err := e.renderListCardWithMode(msg.SessionKey, requestedPage, allMode)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, err.Error())
 		return
@@ -5424,6 +5457,16 @@ func (e *Engine) cardNextButton(action string) CardButton {
 // Used to reduce repetition across render functions that share this pattern.
 func (e *Engine) simpleCard(title, color, content string) *Card {
 	return NewCard().Title(title, color).Markdown(content).Buttons(e.cardBackButton()).Build()
+}
+
+// renderListCardSafeWithMode wraps renderListCardWithMode and returns an error
+// card on failure (for nav: re-render paths that can't propagate errors).
+func (e *Engine) renderListCardSafeWithMode(sessionKey string, page int, allMode bool) *Card {
+	card, err := e.renderListCardWithMode(sessionKey, page, allMode)
+	if err != nil {
+		return e.simpleCard(e.i18n.T(MsgListError), "red", err.Error())
+	}
+	return card
 }
 
 // renderListCardSafe wraps renderListCard and returns an error card on failure.
@@ -7767,13 +7810,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/status":
 		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
 	case "/list":
-		page := 1
-		if args != "" {
-			if n, err := strconv.Atoi(args); err == nil && n > 0 {
-				page = n
-			}
-		}
-		return e.renderListCardSafe(sessionKey, page)
+		allMode, page := parseListArgs(strings.Fields(args))
+		return e.renderListCardSafeWithMode(sessionKey, page, allMode)
 	case "/dir":
 		page := 1
 		if args != "" {
@@ -8786,12 +8824,19 @@ func (e *Engine) renderModeCard() *Card {
 }
 
 func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
+	return e.renderListCardWithMode(sessionKey, page, false)
+}
+
+// renderListCardWithMode renders the /list card. When allMode is true, the card
+// shows sessions across all work_dirs (via AllSessionsLister) and each row gets
+// a 📁 cwd suffix; otherwise behaves identically to legacy /list (current
+// work_dir only, owned-filter applied).
+func (e *Engine) renderListCardWithMode(sessionKey string, page int, allMode bool) (*Card, error) {
 	agent, sessions := e.sessionContextForKey(sessionKey)
-	agentSessions, err := agent.ListSessions(e.ctx)
+	agentSessions, err := e.fetchSessionsForList(agent, sessions, allMode)
 	if err != nil {
 		return nil, fmt.Errorf(e.i18n.T(MsgListError), err)
 	}
-	agentSessions = e.applySessionFilter(agentSessions, sessions)
 	if len(agentSessions) == 0 {
 		return e.simpleCard(e.i18n.Tf(MsgCardTitleSessions, agent.Name(), 0), "turquoise", e.i18n.T(MsgListEmpty)), nil
 	}
@@ -8809,6 +8854,9 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	}
 
 	agentName := agent.Name()
+	if allMode {
+		agentName += " · all"
+	}
 	activeSession := sessions.GetOrCreateActive(sessionKey)
 	activeAgentID := activeSession.GetAgentSessionID()
 
@@ -8817,6 +8865,11 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 		titleStr = e.i18n.Tf(MsgCardTitleSessionsPaged, agentName, total, page, totalPages)
 	} else {
 		titleStr = e.i18n.Tf(MsgCardTitleSessions, agentName, total)
+	}
+
+	navCmd := "/list"
+	if allMode {
+		navCmd = "/list all"
 	}
 
 	cb := NewCard().Title(titleStr, "turquoise")
@@ -8843,21 +8896,31 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 		if s.ID == activeAgentID {
 			btnType = "primary"
 		}
+		row := e.i18n.Tf(MsgListItem, marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04"))
+		if allMode && s.WorkDir != "" {
+			row += " · 📁 " + abbrevWorkDir(s.WorkDir)
+		}
+		// In all mode, /switch by index is ambiguous across cwds, so pass the
+		// raw UUID instead — cmdSwitch resolves it and (future) auto-cd's.
+		switchTarget := fmt.Sprintf("%d", i+1)
+		if allMode {
+			switchTarget = s.ID
+		}
 		cb.ListItemBtn(
-			e.i18n.Tf(MsgListItem, marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04")),
+			row,
 			fmt.Sprintf("#%d", i+1),
 			btnType,
-			fmt.Sprintf("act:/switch %d", i+1),
+			fmt.Sprintf("act:/switch %s", switchTarget),
 		)
 	}
 
 	var navBtns []CardButton
 	if page > 1 {
-		navBtns = append(navBtns, e.cardPrevButton(fmt.Sprintf("nav:/list %d", page-1)))
+		navBtns = append(navBtns, e.cardPrevButton(fmt.Sprintf("nav:%s %d", navCmd, page-1)))
 	}
 	navBtns = append(navBtns, e.cardBackButton())
 	if page < totalPages {
-		navBtns = append(navBtns, e.cardNextButton(fmt.Sprintf("nav:/list %d", page+1)))
+		navBtns = append(navBtns, e.cardNextButton(fmt.Sprintf("nav:%s %d", navCmd, page+1)))
 	}
 	cb.Buttons(navBtns...)
 
@@ -8866,6 +8929,23 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	}
 
 	return cb.Build(), nil
+}
+
+// abbrevWorkDir shortens an absolute work_dir path for compact list display.
+// Replaces $HOME with ~ and trims to ~36 runes from the right (preserves the
+// most meaningful trailing components).
+func abbrevWorkDir(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if strings.HasPrefix(p, home) {
+			p = "~" + strings.TrimPrefix(p, home)
+		}
+	}
+	r := []rune(p)
+	const maxLen = 36
+	if len(r) <= maxLen {
+		return p
+	}
+	return "…" + string(r[len(r)-maxLen+1:])
 }
 
 // dirCardTruncPath shortens absolute paths for card list rows.

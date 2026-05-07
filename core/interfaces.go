@@ -253,6 +253,20 @@ type Agent interface {
 	Stop() error
 }
 
+// AllSessionsLister is an optional capability for agents that can enumerate
+// sessions across all work_dirs (not just the currently configured one).
+//
+// For agents whose backing storage is keyed by work_dir on disk (e.g. Claude
+// Code's ~/.claude/projects/<encoded>/<uuid>.jsonl layout), implementing this
+// interface lets users browse historical sessions originating from any
+// directory in one /list view, with each AgentSessionInfo.WorkDir populated to
+// disambiguate.
+//
+// Agents that don't implement this fall back to ListSessions (single work_dir).
+type AllSessionsLister interface {
+	ListAllSessions(ctx context.Context) ([]AgentSessionInfo, error)
+}
+
 // AgentSession represents a running interactive agent session with a persistent process.
 type AgentSession interface {
 	// Send sends a user message (with optional images and files) to the running agent process.

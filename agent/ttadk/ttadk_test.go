@@ -459,3 +459,90 @@ func TestFindProjectDir_NotFound(t *testing.T) {
 		t.Errorf("findProjectDir for nonexistent project = %q, want empty string", found)
 	}
 }
+
+// TestListAllSessions verifies that ListAllSessions enumerates sessions across
+// all ~/.claude/projects/<encoded>/ directories, populating WorkDir on each
+// AgentSessionInfo by reading cwd from the jsonl payload.
+func TestListAllSessions(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+
+	// Set up two project dirs with one session each, mimicking what jieli/
+	// claude-acp/terminal claude leave behind in different cwds.
+	type fixture struct {
+		workDir   string
+		sessionID string
+		body      string
+	}
+	fixtures := []fixture{
+		{
+			workDir:   "/Users/test/Projects/alpha",
+			sessionID: "11111111-1111-1111-1111-111111111111",
+			body: `{"type":"user","message":{"content":"hi from alpha"}}
+{"type":"assistant","cwd":"/Users/test/Projects/alpha","gitBranch":"main","sessionId":"11111111-1111-1111-1111-111111111111","message":{"content":"hello"}}
+`,
+		},
+		{
+			workDir:   "/Users/test/Projects/beta",
+			sessionID: "22222222-2222-2222-2222-222222222222",
+			body: `{"type":"user","message":{"content":"hi from beta"}}
+{"type":"assistant","cwd":"/Users/test/Projects/beta","gitBranch":"dev","sessionId":"22222222-2222-2222-2222-222222222222","message":{"content":"yo"}}
+`,
+		},
+	}
+	for _, f := range fixtures {
+		key := encodeClaudeProjectKey(f.workDir)
+		dir := filepath.Join(projectsBase, key)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		path := filepath.Join(dir, f.sessionID+".jsonl")
+		if err := os.WriteFile(path, []byte(f.body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	a := &Agent{workDir: "/Users/test/Projects/alpha"}
+	sessions, err := a.ListAllSessions(t.Context())
+	if err != nil {
+		t.Fatalf("ListAllSessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("want 2 sessions across 2 project dirs, got %d", len(sessions))
+	}
+
+	byID := map[string]core.AgentSessionInfo{}
+	for _, s := range sessions {
+		byID[s.ID] = s
+	}
+	for _, f := range fixtures {
+		got, ok := byID[f.sessionID]
+		if !ok {
+			t.Errorf("session %s not returned", f.sessionID)
+			continue
+		}
+		if got.WorkDir != f.workDir {
+			t.Errorf("session %s WorkDir = %q, want %q", f.sessionID, got.WorkDir, f.workDir)
+		}
+		if got.MessageCount == 0 {
+			t.Errorf("session %s MessageCount = 0, want >0", f.sessionID)
+		}
+	}
+}
+
+// TestListAllSessions_NoProjectsDir verifies graceful return when
+// ~/.claude/projects/ does not exist (fresh machine).
+func TestListAllSessions_NoProjectsDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	a := &Agent{workDir: "/whatever"}
+	sessions, err := a.ListAllSessions(t.Context())
+	if err != nil {
+		t.Fatalf("ListAllSessions on empty home: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Errorf("want 0 sessions, got %d", len(sessions))
+	}
+}

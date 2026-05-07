@@ -217,4 +217,9 @@ type AgentSessionInfo struct {
 	MessageCount int
 	ModifiedAt   time.Time
 	GitBranch    string
+	// WorkDir is the project root the session was created in. Populated by
+	// AllSessionsLister implementations to disambiguate sessions that live in
+	// different ~/.claude/projects/<encoded>/ directories. Empty string means
+	// "same as the agent's current work_dir" (single-dir ListSessions).
+	WorkDir string
 }

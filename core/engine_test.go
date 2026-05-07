@@ -10740,3 +10740,53 @@ func TestBtwAlias_ResolvesToPs(t *testing.T) {
 		t.Fatalf("matchPrefix(\"ps\") = %q, want \"ps\"", id2)
 	}
 }
+
+func TestParseListArgs(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantAllMode bool
+		wantPage    int
+	}{
+		{"empty defaults to legacy single-cwd page 1", nil, false, 1},
+		{"numeric only stays legacy", []string{"3"}, false, 3},
+		{"all keyword switches to all mode", []string{"all"}, true, 1},
+		{"all + page", []string{"all", "2"}, true, 2},
+		{"ALL is case-insensitive", []string{"ALL"}, true, 1},
+		{"unknown leading token falls back to legacy page 1", []string{"foo"}, false, 1},
+		{"zero page is rejected, stays at 1", []string{"0"}, false, 1},
+		{"negative page is rejected, stays at 1", []string{"-2"}, false, 1},
+		{"all + zero stays at 1", []string{"all", "0"}, true, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAll, gotPage := parseListArgs(tt.args)
+			if gotAll != tt.wantAllMode || gotPage != tt.wantPage {
+				t.Errorf("parseListArgs(%v) = (%v, %d), want (%v, %d)",
+					tt.args, gotAll, gotPage, tt.wantAllMode, tt.wantPage)
+			}
+		})
+	}
+}
+
+func TestAbbrevWorkDir(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	long := strings.Repeat("/segment", 10)
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"short path unchanged", "/foo/bar", "/foo/bar"},
+		{"home replaced with tilde", filepath.Join(home, "Projects", "alpha"), "~/Projects/alpha"},
+		{"long path truncated from left preserves tail", long, "…" + long[len(long)-35:]},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := abbrevWorkDir(tt.in)
+			if got != tt.want {
+				t.Errorf("abbrevWorkDir(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

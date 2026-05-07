@@ -461,7 +461,7 @@ func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, erro
 			continue
 		}
 
-		summary, msgCount := scanSessionMeta(filepath.Join(projectDir, name))
+		summary, msgCount, _ := scanSessionMeta(filepath.Join(projectDir, name))
 
 		sessions = append(sessions, core.AgentSessionInfo{
 			ID:           sessionID,
@@ -475,6 +475,66 @@ func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, erro
 		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
 	})
 
+	return sessions, nil
+}
+
+// ListAllSessions implements core.AllSessionsLister. It enumerates sessions
+// across every ~/.claude/projects/<encoded>/ directory, populating WorkDir on
+// each AgentSessionInfo from the cwd recorded inside the jsonl payload.
+//
+// This is what powers /list all in the engine: a global view of historical
+// sessions regardless of which work_dir created them (terminal claude, jieli,
+// ttadk-hand, prior cc-connect runs, etc.).
+func (a *Agent) ListAllSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("ttadk: cannot determine home dir: %w", err)
+	}
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+
+	projectDirs, err := os.ReadDir(projectsBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ttadk: read projects base: %w", err)
+	}
+
+	var sessions []core.AgentSessionInfo
+	for _, projectEntry := range projectDirs {
+		if !projectEntry.IsDir() {
+			continue
+		}
+		projectDir := filepath.Join(projectsBase, projectEntry.Name())
+		entries, err := os.ReadDir(projectDir)
+		if err != nil {
+			slog.Warn("ttadk: skip unreadable project dir", "dir", projectDir, "error", err)
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			path := filepath.Join(projectDir, name)
+			summary, msgCount, cwd := scanSessionMeta(path)
+			sessions = append(sessions, core.AgentSessionInfo{
+				ID:           strings.TrimSuffix(name, ".jsonl"),
+				Summary:      summary,
+				MessageCount: msgCount,
+				ModifiedAt:   info.ModTime(),
+				WorkDir:      cwd,
+			})
+		}
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
+	})
 	return sessions, nil
 }
 
@@ -498,28 +558,33 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return os.Remove(path)
 }
 
-func scanSessionMeta(path string) (string, int) {
+// scanSessionMeta extracts a summary line, message count, and the recorded
+// cwd from a Claude Code session jsonl file. cwd is the first non-empty cwd
+// field encountered (Claude Code stamps it on most records); empty string if
+// none found (unusual but possible for truncated/corrupt sessions).
+func scanSessionMeta(path string) (summary string, count int, cwd string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", 0
+		return "", 0, ""
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 
-	var summary string
-	var count int
-
 	for scanner.Scan() {
 		var entry struct {
 			Type    string `json:"type"`
+			Cwd     string `json:"cwd"`
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
+		}
+		if cwd == "" && entry.Cwd != "" {
+			cwd = entry.Cwd
 		}
 		if entry.Type == "user" || entry.Type == "assistant" {
 			count++
@@ -533,7 +598,7 @@ func scanSessionMeta(path string) (string, int) {
 	if utf8.RuneCountInString(summary) > 40 {
 		summary = string([]rune(summary)[:40]) + "..."
 	}
-	return summary, count
+	return summary, count, cwd
 }
 
 var xmlTagRe = regexp.MustCompile(`<[^>]+>`)
